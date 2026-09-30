@@ -276,6 +276,8 @@ class DecisionModel(nn.Module):
     def load(cls, output, device="cuda:0"):
         output = Path(output)
         config = json.loads((output / "model.json").read_text())
+        if config.get("method") == "native_qwen_visual_noul":
+            raise ValueError("Visual checkpoint requires VisualDecisionModel.load; the text path would discard its images")
         model = cls(config["model_id"], config["revision"], device=device,
                     lora_rank=0, max_length=config["max_length"])
         if config["lora_rank"]:
