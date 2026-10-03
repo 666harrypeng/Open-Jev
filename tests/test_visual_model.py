@@ -64,6 +64,19 @@ class VisualModelTests(unittest.TestCase):
         self.assertIsNotNone(model.head.weight.grad)
         self.assertTrue(all(p.grad is None for p in model.backbone.parameters()))
 
+    def test_prepared_inputs_match_raw_images_and_gradients(self):
+        from jev.visual_model import encode_visual_inputs
+        model=self.model()
+        image=torch.full((1,1,3,8,8),100,dtype=torch.uint8)
+        images={"overview":image,"wrist":image+20}
+        encoded=encode_visual_inputs(model.processor,["Is it tilted?"],images,model.camera_names,64)
+        direct=model(["Is it tilted?"],images)
+        prepared=model(encoded=encoded)
+        torch.testing.assert_close(direct,prepared)
+        prepared.sum().backward()
+        self.assertGreater(float(model.head.weight.grad.abs().sum()),0.)
+        with self.assertRaises(ValueError):model(["q"],images,encoded=encoded)
+
     def test_history_and_wrong_camera_sets_are_rejected(self):
         model = self.model()
         image = torch.zeros(1, 1, 3, 8, 8, dtype=torch.uint8)

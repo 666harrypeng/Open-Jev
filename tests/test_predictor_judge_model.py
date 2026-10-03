@@ -34,6 +34,18 @@ class PredictorJudgeModelTests(unittest.TestCase):
         self.inputs=dict(questions=['Will it tilt?'],observations={c:torch.zeros(1,3,3,8,8,dtype=torch.uint8) for c in ['overview','wrist']},
             robot_state=torch.zeros(1,16),remaining_actions=torch.ones(1,8,8),action_mask=torch.tensor([[1,1,1,0,0,0,0,0]],dtype=torch.bool),
             action_dt_s=torch.tensor([.05]),history_mask=torch.tensor([[0,1,1]],dtype=torch.bool),constraint_context=[{'source':'none','text':''}])
+    def test_prepared_cpu_inputs_match_raw_path_and_keep_projection_gradients(self):
+        from jev.predictor_judge_model import encode_predictor_judge_visual_inputs
+        raw=self.model(**self.inputs)
+        visual={k:self.inputs[k] for k in ['questions','observations','action_mask','action_dt_s','history_mask','constraint_context']}
+        encoded=encode_predictor_judge_visual_inputs(self.model.processor,self.model.model_config,**visual)
+        numbers={k:self.inputs[k] for k in ['robot_state','remaining_actions','action_mask','action_dt_s','history_mask']}
+        result=self.model(encoded=encoded,**numbers)
+        torch.testing.assert_close(raw,result,rtol=0,atol=0)
+        result.sum().backward()
+        self.assertGreater(self.model.action_projection[0].weight.grad.abs().sum(),0)
+        self.assertTrue(all(not x.is_cuda for x in encoded.values() if isinstance(x,torch.Tensor)))
+
     def test_padding_is_masked_and_does_not_change_logits(self):
         expected=self.model(**self.inputs);x=self.inputs['remaining_actions'].clone();x[:,3:]=float('nan')
         changed=self.model(**{**self.inputs,'remaining_actions':x});torch.testing.assert_close(expected,changed)

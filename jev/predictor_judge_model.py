@@ -6,6 +6,49 @@ from torch import nn
 from .visual_model import VisualDecisionModel, last_valid_hidden
 
 
+def encode_predictor_judge_visual_inputs(processor, model_config, questions, observations,
+                                        action_mask, action_dt_s, history_mask, constraint_context=None):
+    """CPU-only visual/text preparation; numeric projections remain inside the trainable model."""
+    from PIL import Image
+    b=len(questions);f=model_config['history_frames'];h=model_config['max_actions']
+    camera_names=model_config.get('camera_names',['overview','wrist'])
+    if b<1 or any(not isinstance(q,str) or not q.strip() for q in questions):raise ValueError('Nonempty NL questions required')
+    if set(observations)!=set(camera_names):raise ValueError('Missing camera view')
+    for images in observations.values():
+        if images.dtype!=torch.uint8 or images.ndim!=5 or images.shape[:3]!=(b,f,3):raise ValueError('Expected B,F,3,H,W uint8 history')
+    mask=action_mask.cpu();hm=history_mask.cpu();dt=action_dt_s.float().cpu().reshape(-1)
+    if mask.dtype!=torch.bool or mask.shape!=(b,h) or hm.dtype!=torch.bool or hm.shape!=(b,f):raise ValueError('Boolean masks required')
+    count=mask.sum(-1);hc=hm.sum(-1)
+    if (count==0).any() or not torch.equal(mask,torch.arange(h)[None]<count[:,None]):raise ValueError('Nonempty valid action prefix required')
+    if (hc==0).any() or not torch.equal(hm,torch.arange(f)[None]>=f-hc[:,None]):raise ValueError('Adjacent history suffix required')
+    if dt.shape!=(b,) or not torch.isfinite(dt).all() or (dt<=0).any():raise ValueError('Positive action interval required')
+    contexts=constraint_context or [{'source':'none','text':''} for _ in range(b)]
+    if len(contexts)!=b:raise ValueError('Context batch mismatch')
+    for c in contexts:
+        if set(c)!={'source','text'} or c['source'] not in ('none','observed_history') or not isinstance(c['text'],str):raise ValueError('Only causal observed context is allowed; oracle is supervision')
+        if c['source']=='none' and c['text']:raise ValueError('Absent context cannot contain text')
+    marker=processor.tokenizer.pad_token
+    if not marker or any(marker in q or marker in c['text'] for q,c in zip(questions,contexts)):raise ValueError('Reserved numeric marker in text')
+    images=[];prompts=[]
+    for i,q in enumerate(questions):
+        content=[]
+        for t in range(f):
+            if not hm[i,t]:continue
+            for camera in camera_names:
+                im=Image.fromarray(observations[camera][i,t].detach().cpu().permute(1,2,0).numpy())
+                images.append(im);content.extend([{'type':'text','text':f'{camera}, relative step {t-f+1}, dt={float(dt[i]):.6g}s:'},{'type':'image','image':im}])
+        text=(f'{q}\nPredict a NEW violation during the {int(count[i])} valid remaining commands. '
+              f'Command interval: {float(dt[i]):.6g} seconds.\n')
+        if contexts[i]['text']:text+='Observed context: '+contexts[i]['text']+'\n'
+        text+='Current robot state token: '+marker+'\nRemaining command tokens: '+' '.join([marker]*h)+'\nAnswer yes or no.'
+        content.append({'type':'text','text':text})
+        prompts.append(processor.apply_chat_template([{'role':'user','content':content}],tokenize=False,add_generation_prompt=True,enable_thinking=False))
+    encoded=processor(text=prompts,images=images,padding=True,return_tensors='pt')
+    if 'pixel_values' not in encoded:raise ValueError('Missing native visual inputs')
+    if encoded['input_ids'].shape[1]>model_config['max_length']:raise ValueError('PredictorJudge input exceeds token budget')
+    return dict(encoded)
+
+
 class PredictorJudgeModel(VisualDecisionModel):
     def __init__(self, backbone, processor, head, model_config):
         super().__init__(backbone,processor,head,model_config)
@@ -31,13 +74,8 @@ class PredictorJudgeModel(VisualDecisionModel):
                 raise ValueError('Invalid '+name)
             buffer.copy_(value)
 
-    def prepare_predictor_judge_inputs(self,questions,observations,robot_state,remaining_actions,action_mask,action_dt_s,history_mask,constraint_context=None):
-        from PIL import Image
-        b=len(questions);f=self.model_config['history_frames'];h=self.model_config['max_actions'];device=self.head.weight.device
-        if b<1 or any(not isinstance(q,str) or not q.strip() for q in questions):raise ValueError('Nonempty NL questions required')
-        if set(observations)!=set(self.camera_names):raise ValueError('Missing camera view')
-        for images in observations.values():
-            if images.dtype!=torch.uint8 or images.ndim!=5 or images.shape[:3]!=(b,f,3):raise ValueError('Expected B,F,3,H,W uint8 history')
+    def prepare_predictor_judge_inputs(self,questions,observations,robot_state,remaining_actions,action_mask,action_dt_s,history_mask,constraint_context=None,*,encoded=None):
+        b=robot_state.shape[0];f=self.model_config['history_frames'];h=self.model_config['max_actions'];device=self.head.weight.device
         state=robot_state.to(device=device,dtype=torch.float32);actions=remaining_actions.to(device=device,dtype=torch.float32)
         mask=action_mask.to(device);hm=history_mask.to(device);dt=action_dt_s.to(device=device,dtype=torch.float32).reshape(-1)
         if state.shape!=(b,self.model_config['state_dim']) or actions.shape!=(b,h,8):raise ValueError('State/action shape mismatch')
@@ -48,30 +86,12 @@ class PredictorJudgeModel(VisualDecisionModel):
         if (hc==0).any() or not torch.equal(hm,torch.arange(f,device=device)[None]>=f-hc[:,None]):raise ValueError('History must be an adjacent suffix ending now')
         if dt.shape!=(b,) or not torch.isfinite(dt).all() or (dt<=0).any():raise ValueError('Positive per-command interval required')
         if not torch.isfinite(state).all() or not torch.isfinite(actions[mask]).all():raise ValueError('Nonfinite valid numeric input')
-        contexts=constraint_context or [{'source':'none','text':''} for _ in range(b)]
-        if len(contexts)!=b:raise ValueError('Context batch mismatch')
-        for c in contexts:
-            if set(c)!={'source','text'} or c['source'] not in ('none','observed_history') or not isinstance(c['text'],str):raise ValueError('Only causal observed context is allowed; oracle is supervision')
-            if c['source']=='none' and c['text']:raise ValueError('Absent context cannot contain text')
-        marker=self.processor.tokenizer.pad_token
-        if not marker or any(marker in q or marker in c['text'] for q,c in zip(questions,contexts)):raise ValueError('Reserved numeric marker in text')
-        images=[];prompts=[]
-        for i,q in enumerate(questions):
-            content=[]
-            for t in range(f):
-                if not hm[i,t]:continue
-                for camera in self.camera_names:
-                    im=Image.fromarray(observations[camera][i,t].detach().cpu().permute(1,2,0).numpy())
-                    images.append(im);content.extend([{'type':'text','text':f'{camera}, relative step {t-f+1}, dt={float(dt[i]):.6g}s:'},{'type':'image','image':im}])
-            text=(f'{q}\nPredict a NEW violation during the {int(count[i])} valid remaining commands. '
-                  f'Command interval: {float(dt[i]):.6g} seconds.\n')
-            if contexts[i]['text']:text+='Observed context: '+contexts[i]['text']+'\n'
-            text+='Current robot state token: '+marker+'\nRemaining command tokens: '+' '.join([marker]*h)+'\nAnswer yes or no.'
-            content.append({'type':'text','text':text})
-            prompts.append(self.processor.apply_chat_template([{'role':'user','content':content}],tokenize=False,add_generation_prompt=True,enable_thinking=False))
-        encoded=self.processor(text=prompts,images=images,padding=True,return_tensors='pt')
-        if 'pixel_values' not in encoded:raise ValueError('Missing native visual inputs')
-        encoded={k:v.to(device) if isinstance(v,torch.Tensor) else v for k,v in encoded.items()}
+        if encoded is None:
+            encoded=encode_predictor_judge_visual_inputs(self.processor,self.model_config,questions,observations,
+                action_mask,action_dt_s,history_mask,constraint_context)
+        elif questions is not None or observations is not None or constraint_context is not None:
+            raise ValueError('Use raw or prepared visual inputs, not both')
+        encoded={k:v.to(device,non_blocking=True) if isinstance(v,torch.Tensor) else v for k,v in encoded.items()}
         ids=encoded.pop('input_ids');attention=encoded['attention_mask'].clone()
         slots=(ids==self.processor.tokenizer.pad_token_id)&attention.bool()
         if not torch.all(slots.sum(-1)==h+1):raise ValueError('Numeric marker tokenization is not one token per slot')
@@ -97,8 +117,8 @@ class PredictorJudgeModel(VisualDecisionModel):
         self.last_input_tokens=int(attention.sum());self.last_sequence_length=ids.shape[1]
         return encoded
 
-    def forward(self,questions,observations,robot_state,remaining_actions,action_mask,action_dt_s,history_mask,constraint_context=None):
-        encoded=self.prepare_predictor_judge_inputs(questions,observations,robot_state,remaining_actions,action_mask,action_dt_s,history_mask,constraint_context)
+    def forward(self,questions=None,observations=None,robot_state=None,remaining_actions=None,action_mask=None,action_dt_s=None,history_mask=None,constraint_context=None,*,encoded=None):
+        encoded=self.prepare_predictor_judge_inputs(questions,observations,robot_state,remaining_actions,action_mask,action_dt_s,history_mask,constraint_context,encoded=encoded)
         output=self.backbone(**encoded,use_cache=False,return_dict=True)
         score=self.head(last_valid_hidden(output.last_hidden_state,encoded['attention_mask']).float()).squeeze(-1)
         return torch.stack([torch.zeros_like(score),score],-1)

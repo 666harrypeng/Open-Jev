@@ -17,6 +17,36 @@ def last_valid_hidden(hidden, attention_mask):
     return hidden[torch.arange(len(last), device=hidden.device), last]
 
 
+def encode_visual_inputs(processor, questions, observations, camera_names, max_length):
+    from PIL import Image
+    if not questions or any(not isinstance(q, str) or not q.strip() for q in questions):
+        raise ValueError("Provide nonempty natural-language questions")
+    if set(observations) != set(camera_names):
+        raise ValueError("The model requires exactly its configured camera views")
+    for values in observations.values():
+        if values.ndim != 5 or values.shape[:3] != (len(questions), 1, 3) or values.dtype != torch.uint8:
+            raise ValueError("Expected B,1,3,H,W uint8 current-camera images, without history")
+    images, prompts = [], []
+    for index, question in enumerate(questions):
+        content = []
+        for camera in camera_names:
+            image = Image.fromarray(observations[camera][index, 0].detach().cpu().permute(1, 2, 0).numpy())
+            images.append(image)
+            content.extend([{"type": "text", "text": f"Current {camera} camera:"},
+                            {"type": "image", "image": image}])
+        content.append({"type": "text", "text": question + "\nJudge the current images. Is the answer yes or no?"})
+        prompts.append(processor.apply_chat_template(
+            [{"role": "user", "content": content}], tokenize=False,
+            add_generation_prompt=True, enable_thinking=False))
+    encoded = processor(text=prompts, images=images, padding=True, return_tensors="pt")
+    if "pixel_values" not in encoded:
+        raise ValueError("Processor failed to produce actual visual inputs")
+    lengths = encoded["attention_mask"].sum(dim=-1)
+    if lengths.max().item() > max_length:
+        raise ValueError("Multimodal input exceeds max_length; images/text are not silently truncated")
+    return dict(encoded)
+
+
 class VisualDecisionModel(nn.Module):
     """One current RGB image per named camera, natural-language question, two logits."""
     def __init__(self, backbone, processor, head, model_config):
@@ -94,39 +124,20 @@ class VisualDecisionModel(nn.Module):
         return self
 
     def prepare_inputs(self, questions, observations):
-        from PIL import Image
-        if not questions or any(not isinstance(q, str) or not q.strip() for q in questions):
-            raise ValueError("Provide nonempty natural-language questions")
-        if set(observations) != set(self.camera_names):
-            raise ValueError("The model requires exactly its configured camera views")
-        for values in observations.values():
-            if values.ndim != 5 or values.shape[:3] != (len(questions), 1, 3) or values.dtype != torch.uint8:
-                raise ValueError("Expected B,1,3,H,W uint8 current-camera images, without history")
-        images, prompts = [], []
-        for index, question in enumerate(questions):
-            content = []
-            for camera in self.camera_names:
-                image = Image.fromarray(observations[camera][index, 0].detach().cpu().permute(1, 2, 0).numpy())
-                images.append(image)
-                content.extend([{"type": "text", "text": f"Current {camera} camera:"},
-                                {"type": "image", "image": image}])
-            content.append({"type": "text", "text": question + "\nJudge the current images. Is the answer yes or no?"})
-            prompts.append(self.processor.apply_chat_template(
-                [{"role": "user", "content": content}], tokenize=False,
-                add_generation_prompt=True, enable_thinking=False))
-        encoded = self.processor(text=prompts, images=images, padding=True, return_tensors="pt")
-        if "pixel_values" not in encoded:
-            raise ValueError("Processor failed to produce actual visual inputs")
-        lengths = encoded["attention_mask"].sum(dim=-1)
-        if lengths.max().item() > self.model_config["max_length"]:
-            raise ValueError("Multimodal input exceeds max_length; images/text are not silently truncated")
-        self.last_input_tokens = int(lengths.sum())
-        self.last_sequence_length = int(encoded["attention_mask"].shape[1])
-        device = self.head.weight.device
-        return {name: value.to(device) if isinstance(value, torch.Tensor) else value for name, value in encoded.items()}
+        encoded=encode_visual_inputs(self.processor,questions,observations,self.camera_names,self.model_config["max_length"])
+        return {name:value.to(self.head.weight.device,non_blocking=True) if isinstance(value,torch.Tensor) else value
+                for name,value in encoded.items()}
 
-    def forward(self, questions, observations):
-        encoded = self.prepare_inputs(questions, observations)
+    def forward(self, questions=None, observations=None, *, encoded=None):
+        if encoded is not None:
+            if questions is not None or observations is not None:
+                raise ValueError("Use either raw images or prepared inputs")
+            encoded={name:value.to(self.head.weight.device,non_blocking=True) if isinstance(value,torch.Tensor) else value
+                     for name,value in encoded.items()}
+        else:
+            encoded=self.prepare_inputs(questions,observations)
+        self.last_input_tokens=int(encoded["attention_mask"].sum().item())
+        self.last_sequence_length=encoded["attention_mask"].shape[1]
         output = self.backbone(**encoded, use_cache=False, return_dict=True)
         hidden = last_valid_hidden(output.last_hidden_state, encoded["attention_mask"])
         score = self.head(hidden.float()).squeeze(-1)

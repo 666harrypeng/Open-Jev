@@ -26,6 +26,19 @@ class FixtureModel(nn.Module):
 
 
 class VisualTrainingTests(unittest.TestCase):
+    def test_distributed_rng_only_reads_current_cuda_device(self):
+        from unittest.mock import patch
+        from jev.visual_training import _rng, _restore_rng
+        with patch('torch.distributed.is_initialized', return_value=True), \
+             patch('torch.cuda.is_available', return_value=True), \
+             patch('torch.cuda.get_rng_state', return_value=torch.tensor([3], dtype=torch.uint8)) as get_one, \
+             patch('torch.cuda.get_rng_state_all', side_effect=AssertionError('other GPU touched')), \
+             patch('torch.cuda.set_rng_state') as set_one:
+            state = _rng()
+            _restore_rng(state)
+            get_one.assert_called_once()
+            set_one.assert_called_once()
+
     def batches(self, epoch, start):
         # Different epoch order; a cursor is part of the continuation contract.
         data = [(torch.tensor([[1., 0.], [0., 1.]]), torch.tensor([[0., 1.], [1., 0.]])),

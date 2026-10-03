@@ -1,4 +1,7 @@
-"""Single-device visual Noul optimization with restartable step-boundary snapshots."""
+"""Single-device and distributed visual Noul optimization with restartable step-boundary snapshots."""
+from contextlib import nullcontext
+import time
+import torch.distributed as dist
 import hashlib
 import json
 import math
@@ -29,21 +32,31 @@ def _hash(path):
     return h.hexdigest()
 
 
-def _rng():
-    return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
+def _rng(device=None):
+    state = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    has_cuda=torch.cuda.is_available() and (device is None or torch.device(device).type=="cuda")
+    if dist.is_initialized():
+        state["cuda_current"] = torch.cuda.get_rng_state() if has_cuda else None
+    else:
+        state["cuda"] = torch.cuda.get_rng_state_all() if has_cuda else []
+    return state
 
 
 def _restore_rng(state):
     random.setstate(state["python"]); np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])
+    if "cuda_current" in state:
+        if state["cuda_current"] is not None:
+            if not torch.cuda.is_available():raise ValueError("Resume requires CUDA")
+            torch.cuda.set_rng_state(state["cuda_current"])
+        return
     if state["cuda"]:
         if not torch.cuda.is_available() or len(state["cuda"]) != torch.cuda.device_count():
             raise ValueError("Resume requires the same visible CUDA device count")
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _save_checkpoint(model, optimizer, output, state, identity):
+def _save_checkpoint(model, optimizer, output, state, identity, rng=None):
     parent = output / "checkpoints"; parent.mkdir(exist_ok=True)
     destination = parent / f"step-{state['completed_step']:08d}"
     if destination.exists():
@@ -53,7 +66,7 @@ def _save_checkpoint(model, optimizer, output, state, identity):
         model.save(temporary / "model")
         payload = {"identity": identity, "trainer": state, "optimizer": optimizer.state_dict(),
                    "parameters": {n:p.detach().cpu().clone() for n,p in model.named_parameters() if p.requires_grad},
-                   "rng": _rng()}
+                   "rng": _rng(model.head.weight.device) if rng is None else rng}
         torch.save(payload, temporary / "training_state.pt")
         manifest = {str(p.relative_to(temporary)): _hash(p) for p in temporary.rglob("*") if p.is_file()}
         (temporary / "checkpoint.json").write_text(json.dumps({"identity":identity,"trainer":state,"files_sha256":manifest},indent=2)+"\n")
@@ -95,6 +108,10 @@ def _rate(step, warmup, maximum):
 
 def fit_updates(model, loader_factory, config, output, *, identity, validation_fn=None, resume=None, stop_after=None):
     """loader_factory(epoch,start_batch) must reconstruct deterministic, cursor-aware order."""
+    distributed=dist.is_available() and dist.is_initialized()
+    rank=dist.get_rank() if distributed else 0
+    world=dist.get_world_size() if distributed else 1
+    base=model.module if hasattr(model,"module") else model
     for key in ("max_steps","accumulation"):
         if type(config[key]) is not int or config[key] < 1: raise ValueError("Invalid "+key)
     if not 0 <= config["warmup_steps"] < config["max_steps"]:
@@ -103,9 +120,11 @@ def fit_updates(model, loader_factory, config, output, *, identity, validation_f
         raise ValueError("stop_after is outside this run")
     output = Path(output).resolve(); output.mkdir(parents=True,exist_ok=True)
     log_path = output / "training.jsonl"
-    if not resume and log_path.exists(): raise FileExistsError(log_path)
-    identity = json.loads(json.dumps({"inputs":identity,"model":model.model_config,"training":config},sort_keys=True))
-    head = list(model.head.parameters()); head_ids = {id(p) for p in head}
+    exists=[log_path.exists() if rank==0 else None]
+    if distributed:dist.broadcast_object_list(exists,src=0)
+    if not resume and exists[0]: raise FileExistsError(log_path)
+    identity = json.loads(json.dumps({"inputs":identity,"model":base.model_config,"training":config,"world_size":world},sort_keys=True))
+    head = list(base.head.parameters()); head_ids = {id(p) for p in head}
     other = [p for p in model.parameters() if p.requires_grad and id(p) not in head_ids]
     optimizer = torch.optim.AdamW([{"params":other,"lr":config["lr"]}, {"params":head,"lr":config["head_lr"]}],
                                  weight_decay=config["weight_decay"])
@@ -119,18 +138,25 @@ def fit_updates(model, loader_factory, config, output, *, identity, validation_f
         snapshots=sorted(p for p in (output/"checkpoints").glob("step-*") if p.name.removeprefix("step-").isdigit())
         if snapshots and resume_path != snapshots[-1].resolve():
             raise ValueError("Resume from the latest checkpoint; older checkpoints cannot rewind this run in place")
-        state,restore_rng = _load_checkpoint(model,optimizer,resume,identity)
+        state,restore_rng = _load_checkpoint(base,optimizer,resume,identity)
+        if distributed:restore_rng=restore_rng[rank]
         checkpoint = str(Path(resume).resolve())
-        old = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
-        prefix = [r for r in old if r["step"] <= state["completed_step"]]
-        if [r["step"] for r in prefix] != list(range(1,state["completed_step"]+1)):
-            raise ValueError("Training log does not cover the resumed checkpoint")
-        if len(prefix) != len(old):
-            fd,backup_name=tempfile.mkstemp(prefix=f"training-before-resume-{len(old)}-",suffix=".jsonl",dir=output)
-            os.close(fd);backup=Path(backup_name)
-            shutil.copy2(log_path,backup)
-            log_path.write_text(''.join(json.dumps(r)+"\n" for r in prefix))
-    (output / "training_identity.json").write_text(json.dumps(identity,indent=2)+"\n")
+        log_error=[None]
+        if rank==0:
+            try:
+                old = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+                prefix = [r for r in old if r["step"] <= state["completed_step"]]
+                if [r["step"] for r in prefix] != list(range(1,state["completed_step"]+1)):
+                    raise ValueError("Training log does not cover the resumed checkpoint")
+                if len(prefix) != len(old):
+                    fd,backup_name=tempfile.mkstemp(prefix=f"training-before-resume-{len(old)}-",suffix=".jsonl",dir=output)
+                    os.close(fd)
+                    shutil.copy2(log_path,backup_name)
+                    log_path.write_text(''.join(json.dumps(r)+"\n" for r in prefix))
+            except Exception as exc:log_error[0]=str(exc)
+        if distributed:dist.broadcast_object_list(log_error,src=0)
+        if log_error[0]:raise ValueError(log_error[0])
+    if rank==0:(output / "training_identity.json").write_text(json.dumps(identity,indent=2)+"\n")
     iterator = iter(loader_factory(state["epoch"],state["batch_offset"]))
     if restore_rng is not None: _restore_rng(restore_rng)
     def next_batch():
@@ -147,34 +173,61 @@ def fit_updates(model, loader_factory, config, output, *, identity, validation_f
         step = state["completed_step"]+1
         model.train();optimizer.zero_grad(set_to_none=True)
         multiplier = _rate(step,config["warmup_steps"],config["max_steps"])
-        for group,base in zip(optimizer.param_groups,(config["lr"],config["head_lr"])):group["lr"]=base*multiplier
+        for group,base_rate in zip(optimizer.param_groups,(config["lr"],config["head_lr"])):group["lr"]=base_rate*multiplier
+        step_start=time.perf_counter()
+        data_start=time.perf_counter()
         microbatches=[next_batch() for _ in range(config["accumulation"])]
+        data_wait=time.perf_counter()-data_start
         sample_count=sum(len(b["targets"]) for b in microbatches)
-        loss_value=0.
-        for batch in microbatches:
-            logits=model(**batch["inputs"])
-            targets=batch["targets"].to(logits.device)
-            loss=noul_loss(logits,targets,config["brier_weight"]).sum()/sample_count
-            loss.backward();loss_value+=float(loss.detach())
+        global_count=torch.tensor(float(sample_count),device=base.head.weight.device)
+        if distributed:dist.all_reduce(global_count)
+        loss_total=torch.zeros((),device=base.head.weight.device)
+        for index,batch in enumerate(microbatches):
+            context=model.no_sync() if distributed and index<len(microbatches)-1 else nullcontext()
+            with context:
+                logits=model(**batch["inputs"])
+                targets=batch["targets"].to(logits.device,non_blocking=True)
+                total=noul_loss(logits,targets,config["brier_weight"]).sum()
+                (total*world/global_count).backward()
+                loss_total+=total.detach()
+        if distributed:dist.all_reduce(loss_total)
+        loss_value=float(loss_total/global_count)
         norm=torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],config["clip_grad_norm"])
         if not torch.isfinite(norm):raise FloatingPointError("Nonfinite training gradient")
         optimizer.step();state["completed_step"]=step
+        if base.head.weight.device.type=='cuda':torch.cuda.synchronize(base.head.weight.device)
+        training_seconds=time.perf_counter()-step_start
+        runtime=torch.tensor([data_wait,training_seconds],device=base.head.weight.device)
+        if distributed:dist.all_reduce(runtime,op=dist.ReduceOp.MAX)
         validation_nll=None;is_best=False
         if validation_fn is not None and (step==config["max_steps"] or config["eval_every"] and step%config["eval_every"]==0):
-            model.eval();validation_nll=float(validation_fn(model,step))
+            model.eval();validation_nll=float(validation_fn(base,step))
             if not math.isfinite(validation_nll):raise FloatingPointError("Nonfinite validation NLL")
             if state["best_nll"] is None or validation_nll<state["best_nll"]:
                 state["best_nll"]=validation_nll;state["best_step"]=step;is_best=True
         record={**state,"step":step,"loss":loss_value,"gradient_norm":float(norm),"validation_nll":validation_nll,
-                "lr":optimizer.param_groups[0]["lr"],"head_lr":optimizer.param_groups[1]["lr"]}
-        with log_path.open("a") as stream:stream.write(json.dumps(record,allow_nan=False)+"\n")
-        print(json.dumps({"event":"train_step","step":step,"loss":loss_value,"validation_nll":validation_nll}),flush=True)
+                "lr":optimizer.param_groups[0]["lr"],"head_lr":optimizer.param_groups[1]["lr"],
+                "global_samples":int(global_count),"data_wait_seconds":float(runtime[0]),"training_step_seconds":float(runtime[1]),
+                "samples_per_second":float(global_count)/float(runtime[1])}
+        if rank==0:
+            with log_path.open("a") as stream:stream.write(json.dumps(record,allow_nan=False)+"\n")
+            print(json.dumps({"event":"train_step","step":step,"loss":loss_value,"validation_nll":validation_nll}),flush=True)
         should_stop=stop_after is not None and step>=stop_after
         if is_best or step==config["max_steps"] or should_stop or config["save_every"] and step%config["save_every"]==0:
-            checkpoint=_save_checkpoint(model,optimizer,output,state,identity)
+            rng=None
+            if distributed:
+                rng=[None]*world
+                dist.all_gather_object(rng,_rng(base.head.weight.device))
+            saved=[None,None]
+            if rank==0:
+                try:saved[0]=_save_checkpoint(base,optimizer,output,state,identity,rng=rng)
+                except Exception as exc:saved[1]=f"{type(exc).__name__}: {exc}"
+            if distributed:dist.broadcast_object_list(saved,src=0)
+            if saved[1]:raise RuntimeError(saved[1])
+            checkpoint=saved[0]
         if should_stop:break
     best_step=state["best_step"] or state["completed_step"]
     result={**state,"checkpoint":checkpoint,"best_checkpoint":str(output/"checkpoints"/f"step-{best_step:08d}"),
             "status":"completed" if state["completed_step"]==config["max_steps"] else "paused"}
-    (output/"training_status.json").write_text(json.dumps(result,indent=2)+"\n")
+    if rank==0:(output/"training_status.json").write_text(json.dumps(result,indent=2)+"\n")
     return result
