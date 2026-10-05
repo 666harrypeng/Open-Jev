@@ -106,7 +106,7 @@ def _rate(step, warmup, maximum):
     return .5 * (1 + math.cos(math.pi * min(1., max(0., progress))))
 
 
-def fit_updates(model, loader_factory, config, output, *, identity, validation_fn=None, resume=None, stop_after=None):
+def fit_updates(model, loader_factory, config, output, *, identity, validation_fn=None, resume=None, stop_after=None, step_fn=None):
     """loader_factory(epoch,start_batch) must reconstruct deterministic, cursor-aware order."""
     distributed=dist.is_available() and dist.is_initialized()
     rank=dist.get_rank() if distributed else 0
@@ -209,6 +209,8 @@ def fit_updates(model, loader_factory, config, output, *, identity, validation_f
                 "lr":optimizer.param_groups[0]["lr"],"head_lr":optimizer.param_groups[1]["lr"],
                 "global_samples":int(global_count),"data_wait_seconds":float(runtime[0]),"training_step_seconds":float(runtime[1]),
                 "samples_per_second":float(global_count)/float(runtime[1])}
+        if base.head.weight.device.type=="cuda":
+            record["peak_cuda_allocated_bytes"]=torch.cuda.max_memory_allocated(base.head.weight.device)
         if rank==0:
             with log_path.open("a") as stream:stream.write(json.dumps(record,allow_nan=False)+"\n")
             print(json.dumps({"event":"train_step","step":step,"loss":loss_value,"validation_nll":validation_nll}),flush=True)
@@ -225,6 +227,7 @@ def fit_updates(model, loader_factory, config, output, *, identity, validation_f
             if distributed:dist.broadcast_object_list(saved,src=0)
             if saved[1]:raise RuntimeError(saved[1])
             checkpoint=saved[0]
+        if rank==0 and step_fn is not None:step_fn(dict(record))
         if should_stop:break
     best_step=state["best_step"] or state["completed_step"]
     result={**state,"checkpoint":checkpoint,"best_checkpoint":str(output/"checkpoints"/f"step-{best_step:08d}"),

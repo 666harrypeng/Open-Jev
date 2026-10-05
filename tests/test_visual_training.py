@@ -70,6 +70,19 @@ class VisualTrainingTests(unittest.TestCase):
                 fit_updates(FixtureModel(), self.batches, {**cfg,"lr":.02}, root/'resume',
                             identity={"data":"fixture"}, resume=result['checkpoint'])
 
+    def test_step_callback_receives_updates_without_entering_checkpoint_identity(self):
+        from jev.visual_training import fit_updates
+        cfg = dict(max_steps=2, accumulation=1, lr=.01, head_lr=.01, weight_decay=0.,
+                   warmup_steps=0, clip_grad_norm=1., brier_weight=.1, save_every=1, eval_every=0)
+        events = []
+        with tempfile.TemporaryDirectory() as temp:
+            result = fit_updates(FixtureModel(), self.batches, cfg, Path(temp), identity={},
+                                 step_fn=lambda row: events.append(dict(row)))
+            self.assertEqual([r['step'] for r in events], [1, 2])
+            self.assertTrue(all('samples_per_second' in r for r in events))
+            saved = json.loads((Path(result['checkpoint'])/'checkpoint.json').read_text())
+            self.assertNotIn('step_fn', saved['identity'])
+
     def test_noul_loss_respects_yes_no_target_order(self):
         from jev.visual_training import noul_loss
         logits = torch.tensor([[0., 3.], [0., -3.]], requires_grad=True)
